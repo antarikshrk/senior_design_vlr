@@ -1,0 +1,131 @@
+import cv2
+import numpy as np
+import argparse
+
+# ── tuneable parameters ────────────────────────────────────────────────────────
+PARAMS = {
+    "L_min":           200,    # brightness floor (0-255). raise → stricter "white"
+    "ab_tol":          12,     # colour-neutrality tolerance (0-50). lower → stricter
+    "white_pct_thresh": 0.55,  # fraction of ROI that must be white (0.0-1.0)
+    "blur_ksize":      5,      # gaussian blur kernel (odd number, 0 = off)
+    "roi_pct":         0.20,   # how much to crop from each edge (0.0 = full frame)
+}
+
+
+def classify(frame):
+    h, w = frame.shape[:2]
+    p = PARAMS["roi_pct"]
+    x1, y1 = int(p * w), int(p * h)
+    x2, y2 = int((1 - p) * w), int((1 - p) * h)
+    roi = frame[y1:y2, x1:x2].copy()
+
+    k = PARAMS["blur_ksize"]
+    if k and k >= 3:
+        roi = cv2.GaussianBlur(roi, (k | 1, k | 1), 0)   # ensure odd
+
+    lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB)
+    L, A, B = cv2.split(lab)
+
+    tol = PARAMS["ab_tol"]
+    neutral = (np.abs(A.astype(np.int16) - 128) <= tol) & \
+              (np.abs(B.astype(np.int16) - 128) <= tol)
+    bright  = L >= PARAMS["L_min"]
+
+    white_frac = float(np.count_nonzero(neutral & bright)) / bright.size
+    is_white   = white_frac >= PARAMS["white_pct_thresh"]
+    return is_white, white_frac
+
+
+def print_params():
+    print("\n── current parameters ───────────────────────────────")
+    for i, (k, v) in enumerate(PARAMS.items(), 1):
+        print(f"  [{i}] {k:<20} = {v}")
+    print("  [r] reset to defaults   [q] quit")
+    print("─────────────────────────────────────────────────────")
+
+
+DEFAULTS = dict(PARAMS)   # snapshot of originals
+
+
+def prompt_change():
+    print_params()
+    choice = input("Enter number to change, [r]eset, or [Enter] to continue: ").strip().lower()
+    if choice == "q":
+        return False          # signal quit
+    if choice == "r":
+        PARAMS.update(DEFAULTS)
+        print("  → parameters reset.")
+        return True
+    if choice.isdigit():
+        idx = int(choice) - 1
+        keys = list(PARAMS.keys())
+        if 0 <= idx < len(keys):
+            key = keys[idx]
+            raw = input(f"  New value for {key} (current={PARAMS[key]}): ").strip()
+            try:
+                # keep the same type (int or float)
+                PARAMS[key] = type(PARAMS[key])(raw)
+                print(f"  → {key} set to {PARAMS[key]}")
+            except ValueError:
+                print("  ✗ invalid value, keeping old.")
+        else:
+            print("  ✗ out of range.")
+    return True
+
+
+def run(cam_index: int, every_n: int):
+    cap = cv2.VideoCapture(cam_index)
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open camera index {cam_index}")
+
+    print(f"\n🎥  Camera {cam_index} opened. Classifying every {every_n} frame(s).")
+    print("    Press Ctrl-C (or type 'q' at the menu) to quit.\n")
+
+    frame_num = 0
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                print("⚠  Frame grab failed – retrying…")
+                continue
+
+            frame_num += 1
+            if frame_num % every_n != 0:
+                continue
+
+            is_white, frac = classify(frame)
+            label = "⬜  WHITE    " if is_white else "🟫  NOT WHITE"
+            print(f"Frame {frame_num:>6} │ {label} │ white_frac={frac:.3f} "
+                  f"│ L_min={PARAMS['L_min']} ab_tol={PARAMS['ab_tol']} "
+                  f"thresh={PARAMS['white_pct_thresh']}")
+
+            # Every 30 classified frames, offer a parameter-tweak menu
+            if (frame_num // every_n) % 30 == 0:
+                keep_going = prompt_change()
+                if not keep_going:
+                    break
+
+    except KeyboardInterrupt:
+        print("\n  Interrupted.")
+    finally:
+        cap.release()
+        print("Camera released. Bye!")
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(description="White-clothing classifier – terminal only")
+    ap.add_argument("--cam",     type=int, default=0,  help="Camera index (default 0)")
+    ap.add_argument("--every",   type=int, default=15, help="Classify every N frames (default 15)")
+    # Quick one-shot overrides so you can bake values into the launch command
+    ap.add_argument("--L_min",   type=int,   default=None)
+    ap.add_argument("--ab_tol",  type=int,   default=None)
+    ap.add_argument("--thresh",  type=float, default=None)
+    ap.add_argument("--roi_pct", type=float, default=None)
+    args = ap.parse_args()
+
+    if args.L_min   is not None: PARAMS["L_min"]            = args.L_min
+    if args.ab_tol  is not None: PARAMS["ab_tol"]           = args.ab_tol
+    if args.thresh  is not None: PARAMS["white_pct_thresh"] = args.thresh
+    if args.roi_pct is not None: PARAMS["roi_pct"]          = args.roi_pct
+
+    run(args.cam, args.every)
