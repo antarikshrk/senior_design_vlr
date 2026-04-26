@@ -8,7 +8,7 @@ _fabric_model = None
 _fabric_classes = None
 _fabric_transform = None
 
-def _load_fabric_model(model_path="fabric_model.pth"):
+def _load_fabric_model(model_path="fabric_modelv2.pth"):
     global _fabric_model, _fabric_classes, _fabric_transform
     p = Path(model_path)
     if not p.exists():
@@ -146,49 +146,46 @@ def get_motion_roi(bg_gray, frame_gray, min_area=4000, dilate_iters=4):
 
 
 def run_webcam(index=0):
-    fabric_ready = _load_fabric_model()
-    if fabric_ready:
+    if _fabric_classes:
         print(f"Fabric model loaded: {_fabric_classes}")
     else:
-        print("No fabric_model.pth found — fabric detection disabled. Run train_fabric.py first.")
+        print("No fabric model loaded — fabric detection disabled.")
 
-    cap = cv2.VideoCapture(index)
+    cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
     if not cap.isOpened():
         raise RuntimeError(f"Could not open webcam index {index}")
 
-    L_min = 200
-    ab_tol = 12
-    white_pct_thresh = 0.55
+    cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)       # disable autofocus
+    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)   # 1 = manual, 3 = auto
+    cap.set(cv2.CAP_PROP_AUTO_WB, 0)         # disable auto white balance
 
-    # Capture background (empty sorter)
-    print("Capturing background — keep the sorter EMPTY for 2 seconds...")
-    bg_frame = None
-    for _ in range(30):  # warm up camera
-        ok, frame = cap.read()
-    ok, bg_frame = cap.read()
-    bg_gray = cv2.cvtColor(bg_frame, cv2.COLOR_BGR2GRAY)
-    bg_gray = cv2.GaussianBlur(bg_gray, (21, 21), 0)
-    print("Background captured. Toss in clothing now!")
-    print("Press 'r' to reset background | 'q' to quit.")
+    # Saved preset (2026-04-24): L_min=68, ab_tol=27, thresh=0.45, exposure=7, bright=127
+    L_min = args.L_min
+    ab_tol = args.ab_tol
+    white_pct_thresh = args.thresh
+
+    print("Press 'q' to quit.")
+
+    win = "Laundry Sorter - Frame"
+    cv2.namedWindow(win)
+    cv2.createTrackbar("L_min",    win, L_min,                    255, lambda _: None)
+    cv2.createTrackbar("ab_tol",   win, ab_tol,                    50, lambda _: None)
+    cv2.createTrackbar("thresh%",  win, int(white_pct_thresh*100), 100, lambda _: None)
+    # Exposure is negative on most webcams (-13 to -1); offset by 13 so slider goes 0..12
+    cv2.createTrackbar("exposure", win, 7, 12, lambda v: cap.set(cv2.CAP_PROP_EXPOSURE, v - 13))
+    cv2.createTrackbar("bright",   win, 128, 255, lambda v: cap.set(cv2.CAP_PROP_BRIGHTNESS, v))
 
     while True:
         ok, frame = cap.read()
         if not ok:
             break
 
-        frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        frame_gray_blur = cv2.GaussianBlur(frame_gray, (21, 21), 0)
+        L_min           = cv2.getTrackbarPos("L_min",   win)
+        ab_tol          = cv2.getTrackbarPos("ab_tol",  win)
+        white_pct_thresh = cv2.getTrackbarPos("thresh%", win) / 100.0
 
-        motion_roi = get_motion_roi(bg_gray, frame_gray_blur)
-
-        if motion_roi:
-            roi = motion_roi
-            roi_source = "MOTION"
-        else:
-            # Fall back to center box if nothing is moving
-            h, w = frame.shape[:2]
-            roi = (int(0.1*w), int(0.1*h), int(0.9*w), int(0.9*h))
-            roi_source = "DEFAULT"
+        h, w = frame.shape[:2]
+        roi = (int(0.1*w), int(0.1*h), int(0.9*w), int(0.9*h))
 
         label, frac, dbg = classify_white_bgr(
             frame,
@@ -200,14 +197,11 @@ def run_webcam(index=0):
         )
 
         x1, y1, x2, y2 = roi
-        color = (0, 255, 0) if roi_source == "MOTION" else (0, 165, 255)
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(frame, roi_source, (x1, y1 - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 165, 255), 2)
 
         fabric_label, fabric_conf = classify_fabric(frame, roi)
 
-        txt = f"{label} | white_frac={frac:.2f} | L_min={L_min} ab_tol={ab_tol} thresh={white_pct_thresh}"
+        txt = f"{label} | white_frac={frac:.2f} | L_min={L_min} ab_tol={ab_tol} thresh={white_pct_thresh:.2f}"
         cv2.putText(frame, txt, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (20, 20, 20), 3, cv2.LINE_AA)
         cv2.putText(frame, txt, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1, cv2.LINE_AA)
 
@@ -219,23 +213,17 @@ def run_webcam(index=0):
         mask_vis = cv2.cvtColor(dbg["white_mask"], cv2.COLOR_GRAY2BGR)
         mask_vis = cv2.resize(mask_vis, (frame.shape[1], frame.shape[0]))
 
-        cv2.imshow("Laundry Sorter - Frame", frame)
+        cv2.imshow(win, frame)
         cv2.imshow("Laundry Sorter - White Mask", mask_vis)
 
         k = cv2.waitKey(1) & 0xFF
         if k == ord('q'):
             break
-        elif k == ord('r'):
-            ok, bg_frame = cap.read()
-            bg_gray = cv2.cvtColor(bg_frame, cv2.COLOR_BGR2GRAY)
-            bg_gray = cv2.GaussianBlur(bg_gray, (21, 21), 0)
-            print("Background reset!")
 
     cap.release()
     cv2.destroyAllWindows()
 
 def run_images(input_path):
-    _load_fabric_model()
     p = Path(input_path)
     if p.is_dir():
         paths = sorted([*p.glob("*.jpg"), *p.glob("*.jpeg"), *p.glob("*.png"), *p.glob("*.bmp")])
@@ -282,11 +270,17 @@ if __name__ == "__main__":
     ap.add_argument("--webcam", action="store_true", help="Run live webcam mode")
     ap.add_argument("--cam", type=int, default=0, help="Webcam index")
     ap.add_argument("--input", type=str, help="Image file or directory")
+    ap.add_argument("--model", type=str, default="fabric_modelv2.pth", help="Fabric model checkpoint")
+    ap.add_argument("--L_min", type=int, default=180, help="Brightness floor for white (default 180)")
+    ap.add_argument("--ab_tol", type=int, default=22, help="Color neutrality tolerance (default 22)")
+    ap.add_argument("--thresh", type=float, default=0.35, help="White pixel fraction threshold (default 0.35)")
     args = ap.parse_args()
 
     if args.webcam:
+        _load_fabric_model(args.model)
         run_webcam(args.cam)
     elif args.input:
+        _load_fabric_model(args.model)
         run_images(args.input)
     else:
         print("Usage:")
